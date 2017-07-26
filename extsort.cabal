@@ -1,0 +1,53 @@
+name: extsort
+version: 0.1.0.0
+license: AllRightsReserved
+license-file: LICENSE
+author: Travis Athougies
+maintainer: travis@athougies.net
+category: Web
+build-type: Simple
+cabal-version: >=1.10
+
+library
+  build-depends: base >=4.7 && <5.0,
+                 bytestring >=0.10 && <0.11,
+                 vector, vector-algorithms,
+                 attoparsec, deepseq, parallel,
+                 conduit, resourcet, mtl, unix,
+                 pqueue, conduit-extra, attoparsec-binary
+  ghc-options: -O2 -funbox-strict-fields -Wall -Werror -fprof-auto
+  default-language: Haskell2010
+  default-extensions: DeriveGeneric
+                      GeneralizedNewtypeDeriving
+                      OverloadedStrings
+                      TupleSections
+                      ScopedTypeVariables
+                      RankNTypes
+  exposed-modules:
+    Data.External.Sort
+    Data.External.Tape
+
+executable sort-hs
+  build-depends: base >=4.7 && <5.0,
+                 extsort,
+                 conduit, resourcet,
+                 conduit-extra,
+                 bytestring, attoparsec,
+                 attoparsec-binary
+  ghc-options: -threaded -O2 -funbox-strict-fields -Wall -Werror
+  default-language: Haskell2010
+  default-extensions: DeriveGeneric
+                      GeneralizedNewtypeDeriving
+                      OverloadedStrings
+                      TupleSections
+                      ScopedTypeVariables
+                      RankNTypes
+  hs-source-dirs: test
+  main-is: Main.hs
+
+executable randoms-hs
+  build-depends: base >=4.7 && <5.0, random
+  ghc-options: -O2
+  default-language: Haskell2010
+  hs-source-dirs: test
+  main-is: Gen.hs

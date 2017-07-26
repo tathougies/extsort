@@ -1,0 +1,6 @@
+random
+.cabal-sandbox
+dist
+*~
+sort.tmp
+*.prof

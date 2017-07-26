@@ -4,32 +4,33 @@ import           Prelude hiding (log, read)
 
 import           Data.External.Tape hiding (log)
 
-import           Control.Applicative
-import           Control.DeepSeq
-import           Control.Exception
-import           Control.Monad
-import           Control.Monad.IO.Class
-import           Control.Monad.Trans.Resource
+import           Control.Applicative ((<|>))
+import           Control.DeepSeq (NFData)
+import           Control.Monad (when, unless, forM_, forM)
+import           Control.Monad.IO.Class (MonadIO, liftIO)
+import           Control.Monad.Trans.Resource (MonadResource, allocate)
 
 import qualified Data.Attoparsec.Binary as Atto (word32be)
 import           Data.Attoparsec.ByteString.Char8 as Atto hiding (take)
 import qualified Data.ByteString.Builder as B
 import           Data.Conduit ((=$=), Conduit, ConduitM, Producer, await, yield)
-import           Data.Function
-import           Data.IORef (readIORef, writeIORef, modifyIORef')
+import           Data.Function (on)
+import           Data.IORef (readIORef, writeIORef)
 import           Data.List (genericReplicate, tails, minimumBy)
-import           Data.Monoid
-import           Data.Ord
+import           Data.Monoid ((<>))
+import qualified Data.Mutable as Mut (readRef, writeRef, modifyRef')
+import           Data.Ord (comparing)
 import qualified Data.Vector as V
 import qualified Data.Vector.Algorithms.Intro as VIO (sortByBounds)
 import qualified Data.Vector.Mutable as VIO
-import           Data.Word
+import           Data.Word (Word8, Word32)
 
 import           Foreign.C.Types
 
 import           GHC.Generics
 
 import           System.IO
+import           System.Posix
 
 data SortingEvent k
     = SortingEventRunDone
@@ -37,9 +38,6 @@ data SortingEvent k
     | SortingEventFinished
       deriving (Show, Generic)
 instance NFData k => NFData (SortingEvent k)
-
-data SortOOM = SortOOM deriving Show
-instance Exception SortOOM
 
 data Serializers a
     = Serializers
@@ -55,6 +53,7 @@ data SortOptions
     , sortOptionsChunkSize   :: Int -- ^ Number to include in initial runs
 
     , sortOptionsWorkingFile :: FilePath -- ^ Where to store tapes
+    , sortOptionsPersistFile :: Bool     -- ^ If True, the working file will not be deleted after the sort
     } deriving Show
 
 -- * Constants
@@ -120,6 +119,8 @@ externalSort options cmpKey keySerializers valueSerializers valueCopier =
      when (blockSize <= kMIN_BLOCK_SIZE) (fail "externalSort: Not enough space")
 
      (_, tapeFile) <- allocate (openTapeFile (sortOptionsWorkingFile options) blockSize) closeTapeFile
+     unless (sortOptionsPersistFile options) $
+       liftIO (removeLink (sortOptionsWorkingFile options))
 
      info "[SORT] Reading input"
      tapes <- sortChunks cmpKey (sortOptionsChunkSize options) =$=
@@ -210,7 +211,7 @@ sinkInitialTapes SortOptions { sortOptionsTapes       = tapeCount }
 
      -- Add dummy runs
      liftIO . forM_ (V.zip (V.fromList outputTapeSizes) (V.tail tapes)) $ \(tapeSz, tape) -> do
-         recs <- readIORef (tapeRuns tape)
+         recs <- Mut.readRef (tapeRuns tape)
 
          let dummies = fromIntegral tapeSz - recs
              dummyBuilder = mconcat (genericReplicate dummies runMarker) <>
@@ -218,7 +219,7 @@ sinkInitialTapes SortOptions { sortOptionsTapes       = tapeCount }
                             finishedMarker
 
          writeTapeBuilder tape dummyBuilder
-         writeIORef (tapeRuns tape) tapeSz
+         Mut.writeRef (tapeRuns tape) tapeSz
 
      info ("Tape sizes " ++ show outputTapeSizes ++ " = " ++ show totalSz)
 
@@ -252,11 +253,11 @@ sinkInitialTapes SortOptions { sortOptionsTapes       = tapeCount }
           fmap (minimumBy (comparing snd)) .
           forM (zip [1..] sizes) $ \(i, expSz) -> do
             let tape = tapes V.! i
-            curSz <- readIORef (tapeRuns tape)
+            curSz <- Mut.readRef (tapeRuns tape)
             pure (i, fromIntegral curSz / (fromIntegral expSz :: Double))
 
       let outputTape = tapes V.! tapeIdx
-      modifyIORef' (tapeRuns outputTape) (+1)
+      Mut.modifyRef' (tapeRuns outputTape) (+1)
 
       pure (tapeIdx, outputTape)
 
@@ -269,7 +270,7 @@ nwayMerges :: forall k v
            -> Serializers k -> Copier v
            -> IO Tape
 nwayMerges tapes initialOutputTape cmpKey keySerializer valueCopier = do
-  nonEmptyTapes <- V.filterM (fmap (> 0) . readIORef . tapeRuns) tapes
+  nonEmptyTapes <- V.filterM (fmap (> 0) . Mut.readRef . tapeRuns) tapes
 
   if V.null nonEmptyTapes
      then pure initialOutputTape
@@ -285,14 +286,13 @@ nwayMerges tapes initialOutputTape cmpKey keySerializer valueCopier = do
 
       rewindTape outputTape
 
-      inputs'' <- V.filterM (fmap (> 0) . readIORef . tapeRuns . snd) inputs'
---      outputSize <- readIORef (tapeRuns outputTape)
+      inputs'' <- V.filterM (fmap (> 0) . Mut.readRef . tapeRuns . snd) inputs'
 
       if V.null inputs''
          then info "No more inputs" >> pure outputTape
          else do
            info "Sort again"
-           nextOutputSize <- readIORef (tapeRuns nextOutputTape)
+           nextOutputSize <- Mut.readRef (tapeRuns nextOutputTape)
            when (nextOutputSize > 0) (fail "nextOutputSize > 0")
 
            outputHd <- readIORef (tapeReadingBlock nextOutputTape)
@@ -318,7 +318,7 @@ nwayMerges tapes initialOutputTape cmpKey keySerializer valueCopier = do
 
       | otherwise = do
           inputs' <- mergeRun inputs mempty outputTape
-          modifyIORef' (tapeRuns outputTape) (+1)
+          Mut.modifyRef' (tapeRuns outputTape) (+1)
           writeTapeBuilder outputTape runMarker
 
           let (finished, alive) =
@@ -345,24 +345,28 @@ nwayMerges tapes initialOutputTape cmpKey keySerializer valueCopier = do
     mergeRun :: V.Vector (SortingEvent k, Tape)
              -> V.Vector (SortingEvent k, Tape)
              -> Tape -> IO (V.Vector (SortingEvent k, Tape))
-    mergeRun inputs runDone outputTape
-      | V.null inputs = log "mergeRun done" >> pure runDone
-      | otherwise =
-          V.ifoldr (\i (x, tp) next ->
-                        case x of
-                          SortingEventRunDone -> do
-                            log ("Row done " ++ show i)
-                            x' <- readSortingRow keySerializer tp
-                            log ("Row done!")
-                            let runDone' = V.cons (x', tp) runDone
-                                inputs' = removeAt i inputs
-                            modifyIORef' (tapeRuns tp) (subtract 1)
-                            mergeRun inputs' runDone' outputTape
-                          SortingEventFinished -> fail "File finished before run done"
-                          _ -> next)
-                   (do inputs' <- doCompare inputs outputTape
-                       mergeRun inputs' runDone outputTape)
-                   inputs
+    mergeRun inputs runDone outputTape = do
+      (inputs', runDone') <-
+        V.foldM (\(inputs', runDone') (i, (x, tp)) ->
+                     case x of
+                       SortingEventRunDone -> do
+                         log ("Row done " ++ show i)
+                         x' <- readSortingRow keySerializer tp
+                         log "Row done!"
+                         let runDone'' = V.cons (x', tp) runDone'
+                             inputs'' = removeAt i inputs'
+                         Mut.modifyRef' (tapeRuns tp) (subtract 1)
+                         pure (inputs'', runDone'')
+                       SortingEventFinished -> fail "File finished before run done"
+                       _ -> pure (inputs', runDone'))
+                (inputs, runDone)
+                (V.indexed inputs)
+
+      if V.null inputs'
+        then log "mergeRun done" >> pure runDone'
+        else do
+          inputs'' <- doCompare inputs' outputTape
+          mergeRun inputs'' runDone' outputTape
 
     doCompare :: V.Vector (SortingEvent k, Tape) -> Tape
               -> IO (V.Vector (SortingEvent k, Tape))

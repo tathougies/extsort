@@ -18,6 +18,7 @@ import qualified Data.ByteString.Internal as BS (toForeignPtr, fromForeignPtr)
 import           Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef')
 import           Data.Monoid ((<>))
 import qualified Data.PQueue.Min as PQ
+import qualified Data.Mutable as Mut
 import           Data.Word
 
 import           Foreign.C.Error
@@ -47,7 +48,7 @@ data Tape
     { tapeReadingBlock        :: IORef (Maybe TapeHead)
     , tapeWritingBlock        :: IORef (Maybe TapeHead)
 
-    , tapeRuns                :: IORef Word
+    , tapeRuns                :: Mut.IOPRef Word
 
     , tapeTapeFile            :: TapeFile
     }
@@ -107,7 +108,7 @@ openTape tapeFile =
   Tape <$> newIORef Nothing
        <*> newIORef Nothing
 
-       <*> newIORef 0
+       <*> Mut.newRef 0
 
        <*> pure tapeFile
 

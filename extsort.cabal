@@ -25,6 +25,7 @@ library
                       ScopedTypeVariables
                       RankNTypes
                       GADTs
+                      BangPatterns
   exposed-modules:
     Data.External.Sort
     Data.External.Tape

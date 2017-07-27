@@ -30,6 +30,8 @@ import           Foreign.Storable
 
 import           System.Posix hiding (release)
 
+import           GHC.Stack
+
 newtype FileBlock = FileBlock Word64 deriving (Show, Eq, Ord, Storable)
 
 data TapeHead
@@ -319,7 +321,7 @@ headFromBlock' tp seqNum (FileBlock nextBlockNumber) =
 
      pure (TapeHead mappedPtr (tapeFileBlockSize fl) seqNum 0 (FileBlock nextBlockNumber))
 
-withReadHead :: Tape -> (TapeHead -> IO (a, TapeHead)) -> IO a
+withReadHead :: HasCallStack => Tape -> (TapeHead -> IO (a, TapeHead)) -> IO a
 withReadHead tp go =
   do rdHead <- readIORef (tapeReadingBlock tp)
      case rdHead of
@@ -329,7 +331,9 @@ withReadHead tp go =
             writeIORef (tapeReadingBlock tp) (Just rdHead'')
             pure x
 
-parseFromTape :: NFData k => Atto.Parser k -> Tape -> IO (Either ([String], String) k)
+parseFromTape :: (HasCallStack, NFData k)
+              => Atto.Parser k -> Tape
+              -> IO (Either ([String], String) k)
 parseFromTape parser tp =
   do log "parseFromTape"
      (closedHeads, r) <- withReadHead tp (parseFromTapeHead [] (Atto.Partial (parse parser)))
@@ -375,7 +379,7 @@ parseFromTape parser tp =
 
            parseFromTapeHead closedHeads nextRes hd'
 
-runCopierInTape :: Copier v -> Tape -> Tape -> IO ()
+runCopierInTape :: HasCallStack => Copier v -> Tape -> Tape -> IO ()
 runCopierInTape copier inputTp outputTp =
   writeTapeGeneric outputTp $ \outputHd ->
   withReadHead outputTp $ \readHd ->
@@ -398,6 +402,8 @@ runCopierInTape copier inputTp outputTp =
             CopyAll next -> do
               outputHd' <- writeTapeHeadBuf outputTp outputHd curData sizeLeft
               doCopy next (advanceHead readHd sizeLeft) outputHd'
+            CopyOnly 0  -> do
+              pure (((), outputHd), readHd)
             CopyOnly sz -> do
               outputHd' <- writeTapeHeadBuf outputTp outputHd curData sz
               pure (((), outputHd'), advanceHead readHd sz)

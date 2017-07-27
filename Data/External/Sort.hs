@@ -2,7 +2,7 @@ module Data.External.Sort where
 
 import           Prelude hiding (log, read, pred)
 
-import           Data.External.Tape hiding (log)
+import           Data.External.Tape
 
 import           Control.Applicative ((<|>))
 import           Control.DeepSeq (NFData)

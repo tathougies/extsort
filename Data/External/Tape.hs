@@ -1,6 +1,22 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# OPTIONS_GHC -fno-warn-unused-top-binds #-}
 
-module Data.External.Tape where
+module Data.External.Tape
+  ( TapeHead, Tape, TapeFile
+
+  , tapeTapeFile, tapeRuns, tapeReadingBlock
+
+  , Copier(..), CopyStatus(..)
+  , noBytesCopy
+
+  , openTapeFile, closeTapeFile
+  , closeReadHead, closeTapeHead
+
+  , openTape, rewindTape
+  , writeTapeBuilder, parseFromTape
+  , runCopierInTape ) where
 
 import           Prelude hiding (rem, log)
 
@@ -32,7 +48,7 @@ import           System.Posix hiding (release)
 
 import           GHC.Stack
 
-newtype FileBlock = FileBlock Word64 deriving (Show, Eq, Ord, Storable)
+newtype FileBlock = FileBlock Word64 deriving (Show, Eq, Ord, Storable, Mut.Prim)
 
 data TapeHead
     = TapeHead
@@ -57,12 +73,12 @@ data Tape
 
 data TapeFile
     = TapeFile
-    { tapeFileHandle    :: Fd
+    { tapeFileHandle    :: !Fd
 
-    , tapeFileBlockSize :: CSize
+    , tapeFileBlockSize :: !CSize
 
-    , tapeFileCurBlock  :: IORef FileBlock
-    , tapeFileSize      :: IORef CSize
+    , tapeFileCurBlock  :: Mut.IOPRef FileBlock
+    , tapeFileSize      :: Mut.IOPRef Word64
 
     , tapeFileFree      :: IORef (PQ.MinQueue FileBlock)
     }
@@ -95,8 +111,8 @@ openTapeFile tmpFilePath blockSize = do
   log ("Open tape file " ++ show tmpFilePath ++ ". block size " ++ show blockSize)
   TapeFile <$> openFd tmpFilePath ReadWrite (Just 0o700) (OpenFileFlags False False False False False)
            <*> pure blockSize
-           <*> newIORef (FileBlock 0)
-           <*> newIORef 0
+           <*> Mut.newRef (FileBlock 0)
+           <*> Mut.newRef 0
            <*> newIORef mempty
 
 closeTapeFile :: TapeFile -> IO ()
@@ -150,14 +166,14 @@ allocateNextBlock tpFl = do
   nextAllocatedBlock@(FileBlock blkNum) <-
     case PQ.minView free of
       Nothing -> do
-        filSz <- readIORef (tapeFileSize tpFl)
-        FileBlock curBlock <- readIORef (tapeFileCurBlock tpFl)
+        filSz <- Mut.readRef (tapeFileSize tpFl)
+        FileBlock curBlock <- Mut.readRef (tapeFileCurBlock tpFl)
 
         let nextAllocatedBlock = curBlock + 1
-            newFileSz = filSz + tapeFileBlockSize tpFl
+            newFileSz = fromIntegral filSz + tapeFileBlockSize tpFl
 
-        writeIORef (tapeFileCurBlock tpFl) (FileBlock nextAllocatedBlock)
-        writeIORef (tapeFileSize tpFl) newFileSz
+        Mut.writeRef (tapeFileCurBlock tpFl) (FileBlock nextAllocatedBlock)
+        Mut.writeRef (tapeFileSize tpFl) (fromIntegral newFileSz)
 
         err <- c_ftruncate (tapeFileHandle tpFl) newFileSz
         when (err < 0) (throwErrno ("nextBlock.ftruncate: " ++ show (newFileSz, curBlock)))
@@ -236,7 +252,7 @@ writeTapeGeneric tp go = do
   pure x
 
 writeTapeBuilder :: Tape -> B.Builder -> IO ()
-writeTapeBuilder tp builder = do
+writeTapeBuilder tp builder =
   writeTapeGeneric tp (go (B.runBuilder builder))
   where
     maxMoreSize = 4096

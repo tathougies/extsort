@@ -6,7 +6,8 @@
 module Data.External.Tape
   ( TapeHead, Tape, TapeFile
 
-  , tapeTapeFile, tapeRuns, tapeReadingBlock
+  , tapeTapeFile, tapeReadingBlock
+  , tapeRuns, tapeRecords
 
   , Copier(..), CopyStatus(..)
   , noBytesCopy
@@ -48,11 +49,24 @@ import           System.Posix hiding (release)
 
 import           GHC.Stack
 
-newtype FileBlock = FileBlock Word64 deriving (Show, Eq, Ord, Storable, Mut.Prim)
+newtype FileBlock = FileBlock Word64
+  deriving (Show, Eq, Ord, Storable, Mut.Prim)
 
-data TapeHead
+data TapeHeadMode = Reading | Writing
+  deriving Show
+
+data TapeHeadForeign (mode :: TapeHeadMode) where
+  TapeHeadForeign :: !(ForeignPtr Word8) -> TapeHeadForeign 'Reading
+  TapeHeadNoForeign :: TapeHeadForeign 'Writing
+
+instance Show (TapeHeadForeign mode) where
+  show (TapeHeadForeign ptr) = "(TapeHeadForeign " ++ show ptr ++ ")"
+  show TapeHeadNoForeign = "TapeHeadNoForeign"
+
+data TapeHead (mode :: TapeHeadMode)
     = TapeHead
     { tapeHeadData        :: !(Ptr ())
+    , tapeHeadForeignData :: !(TapeHeadForeign mode)
     , tapeHeadRawSize     :: !CSize
 
     , tapeHeadBlockNumber :: !CSize
@@ -63,10 +77,11 @@ data TapeHead
 
 data Tape
     = Tape
-    { tapeReadingBlock        :: IORef (Maybe TapeHead)
-    , tapeWritingBlock        :: IORef (Maybe TapeHead)
+    { tapeReadingBlock        :: IORef (Maybe (TapeHead 'Reading))
+    , tapeWritingBlock        :: IORef (Maybe (TapeHead 'Writing))
 
-    , tapeRuns                :: Mut.IOPRef Word
+    , tapeRuns                :: Mut.IOPRef Word32
+    , tapeRecords             :: Mut.IOPRef Word32
 
     , tapeTapeFile            :: TapeFile
     }
@@ -86,7 +101,7 @@ data TapeFile
 newtype Copier v = Copier (Ptr v -> CSize -> IO (CopyStatus v))
 data CopyStatus v
     = CopyAll (Copier v)
-    | CopyOnly CSize
+    | CopyOnly !CSize
 
 -- * Constants
 
@@ -127,16 +142,17 @@ openTape tapeFile =
        <*> newIORef Nothing
 
        <*> Mut.newRef 0
+       <*> Mut.newRef 0
 
        <*> pure tapeFile
 
 tapeUsefulBlockSize :: Tape -> CSize
 tapeUsefulBlockSize tp = tapeFileBlockSize (tapeTapeFile tp) - fromIntegral (sizeOf (undefined :: FileBlock))
 
-nextBlock :: Tape -> TapeHead -> IO FileBlock
+nextBlock :: Tape -> TapeHead 'Reading -> IO FileBlock
 nextBlock tp hd = peek (castPtr (tapeHeadData hd `plusSize` tapeUsefulBlockSize tp))
 
-setNextBlock :: Tape -> TapeHead -> FileBlock -> IO ()
+setNextBlock :: Tape -> TapeHead 'Writing -> FileBlock -> IO ()
 setNextBlock tp hd = poke (castPtr (tapeHeadData hd `plusSize` tapeUsefulBlockSize tp))
 
 rewindTape :: Tape -> IO ()
@@ -193,10 +209,10 @@ allocateNextBlock tpFl = do
 
   pure (nextAllocatedBlock, mappedPtr, tapeFileBlockSize tpFl)
 
-headToNextBlock :: Tape -> TapeHead -> IO TapeHead
+headToNextBlock :: Tape -> TapeHead 'Writing -> IO (TapeHead 'Writing)
 headToNextBlock tp hd = do
   (fileBlk, datPtr, rawSize) <- allocateNextBlock (tapeTapeFile tp)
-  let hd' = TapeHead datPtr rawSize 0 0 fileBlk
+  let hd' = TapeHead datPtr TapeHeadNoForeign rawSize 0 0 fileBlk
 
   setNextBlock tp hd fileBlk
 
@@ -204,43 +220,45 @@ headToNextBlock tp hd = do
 
 -- * Tape heads
 
-tapeHeadCurData :: TapeHead -> Ptr ()
+tapeHeadCurData :: TapeHead mode -> Ptr ()
 tapeHeadCurData hd =
   tapeHeadData hd `plusSize` tapeHeadBlockOffset hd
 
-tapeHeadSizeLeft :: Tape -> TapeHead -> CSize
+tapeHeadSizeLeft :: Tape -> TapeHead mode -> CSize
 tapeHeadSizeLeft tp hd =
   tapeUsefulBlockSize tp - tapeHeadBlockOffset hd
 
-advanceHead :: TapeHead -> CSize -> TapeHead
+advanceHead :: TapeHead mode -> CSize -> TapeHead mode
 advanceHead hd sz =
     hd { tapeHeadBlockOffset = tapeHeadBlockOffset hd + sz }
 
-closeReadHead :: TapeFile -> TapeHead -> IO ()
+closeReadHead :: TapeFile -> TapeHead 'Reading -> IO ()
 closeReadHead fl hd = do
   closeTapeHead hd
 
   modifyIORef' (tapeFileFree fl) (PQ.insert (tapeHeadFileBlock hd))
 
-closeTapeHead :: TapeHead -> IO ()
+closeTapeHead :: TapeHead mode -> IO ()
 closeTapeHead hd = do
   err <- c_munmap (tapeHeadData hd) (tapeHeadRawSize hd)
   when (err < 0) (throwErrno "closeTapeHead.munmap")
 
 -- ** Output with tape heads
 
-writeTapeGeneric :: Tape -> (TapeHead -> IO (a, TapeHead)) -> IO a
+writeTapeGeneric :: Tape -> (TapeHead 'Writing -> IO (a, TapeHead 'Writing)) -> IO a
 writeTapeGeneric tp go = do
   hd <- readIORef (tapeWritingBlock tp)
 
   hd' <- case hd of
            Nothing -> do
              (fileBlk, datPtr, rawSize) <- allocateNextBlock (tapeTapeFile tp)
-             let hd' = TapeHead datPtr rawSize 0 0 fileBlk
+             foreignPtr <- newForeignPtr_ (castPtr datPtr)
+             let hd' = TapeHead datPtr TapeHeadNoForeign rawSize 0 0 fileBlk
+                 readHd = TapeHead datPtr (TapeHeadForeign foreignPtr) rawSize 0 0 fileBlk
 
              rdHd <- readIORef (tapeReadingBlock tp)
              case rdHd of
-               Nothing -> writeIORef (tapeReadingBlock tp) (Just hd')
+               Nothing -> writeIORef (tapeReadingBlock tp) (Just readHd)
                Just {} -> writeIORef (tapeReadingBlock tp) rdHd
 
              pure hd'
@@ -283,7 +301,7 @@ writeTapeBuilder tp builder =
                        writeTapeHeadBuf tp hd' (ptr `plusPtr` bsOff) (fromIntegral bsSz)
                go next' hd''
 
-    fillRequest buf reqSz next hd
+    fillRequest buf reqSz next !hd
       | reqSz > maxMoreSize = fail "writeTapeBuilder.fillRequest: out of memory"
       | otherwise = do
           (written, res') <- next buf reqSz
@@ -298,7 +316,7 @@ writeTapeBuilder tp builder =
                         writeTapeHeadBuf tp hd' (ptr `plusPtr` bsOff) (fromIntegral bsSz)
               pure (go next' hd'')
 
-writeTapeHeadBuf :: Tape -> TapeHead -> Ptr a -> CSize -> IO TapeHead
+writeTapeHeadBuf :: Tape -> TapeHead 'Writing -> Ptr a -> CSize -> IO (TapeHead 'Writing)
 writeTapeHeadBuf tp hd cpyPtr cpySz =
   let remainingBytes = tapeHeadSizeLeft tp hd
   in if cpySz <= remainingBytes
@@ -315,7 +333,7 @@ writeTapeHeadBuf tp hd cpyPtr cpySz =
 
 -- ** Input with tape heads
 
-headFromBlock :: Tape -> TapeHead -> IO TapeHead
+headFromBlock :: Tape -> TapeHead 'Reading -> IO (TapeHead 'Reading)
 headFromBlock tp hd = do
   nextBlockNumber <- nextBlock tp hd
   when (nextBlockNumber == lastBlock) $
@@ -324,7 +342,7 @@ headFromBlock tp hd = do
   log ("Getting next head " ++ show nextBlockNumber)
   headFromBlock' tp (tapeHeadBlockNumber hd + 1) nextBlockNumber
 
-headFromBlock' :: Tape -> CSize -> FileBlock -> IO TapeHead
+headFromBlock' :: Tape -> CSize -> FileBlock -> IO (TapeHead 'Reading)
 headFromBlock' tp seqNum (FileBlock nextBlockNumber) =
   do let hdl = tapeFileHandle fl
          fl = tapeTapeFile tp
@@ -335,9 +353,10 @@ headFromBlock' tp seqNum (FileBlock nextBlockNumber) =
 
      log ("Head from block mapped " ++ show mappedPtr)
 
-     pure (TapeHead mappedPtr (tapeFileBlockSize fl) seqNum 0 (FileBlock nextBlockNumber))
+     foreignPtr <- newForeignPtr_ (castPtr mappedPtr)
+     pure (TapeHead mappedPtr (TapeHeadForeign foreignPtr) (tapeFileBlockSize fl) seqNum 0 (FileBlock nextBlockNumber))
 
-withReadHead :: HasCallStack => Tape -> (TapeHead -> IO (a, TapeHead)) -> IO a
+withReadHead :: Tape -> (TapeHead 'Reading-> IO (a, TapeHead 'Reading)) -> IO a
 withReadHead tp go =
   do rdHead <- readIORef (tapeReadingBlock tp)
      case rdHead of
@@ -352,28 +371,19 @@ parseFromTape :: (HasCallStack, NFData k)
               -> IO (Either ([String], String) k)
 parseFromTape parser tp =
   do log "parseFromTape"
-     (closedHeads, r) <- withReadHead tp (parseFromTapeHead [] (Atto.Partial (parse parser)))
-
-     r' <- case r of
-             Left err -> pure (Left err)
-             Right r' -> do
-               evaluate (rnf r')
-               pure (Right r')
-
-     mapM_ (closeReadHead (tapeTapeFile tp)) closedHeads
-
-     pure r'
+     withReadHead tp (parseFromTapeHead (Atto.Partial (parse parser)))
 
   where
     blockSz = tapeUsefulBlockSize tp
 
-    parseFromTapeHead closedHeads (Done _ r) hd =
-      log "Tape head done" >>
-      pure ((closedHeads, Right r), hd)
-    parseFromTapeHead closedHeads (Fail _ ctxts err) hd =
+    parseFromTapeHead (Done _ r) !hd = do
+      log "Tape head done"
+      evaluate (rnf r)
+      pure (Right r, hd)
+    parseFromTapeHead (Fail _ ctxts err) !hd =
       log "Tape head fail" >>
-      pure ((closedHeads, Left (ctxts, err)), hd)
-    parseFromTapeHead closedHeads (Partial next) hd =
+      pure (Left (ctxts, err), hd)
+    parseFromTapeHead (Partial next) !hd =
       let remainingBytes = tapeHeadSizeLeft tp hd
       in if remainingBytes == 0
          then do
@@ -381,19 +391,25 @@ parseFromTape parser tp =
            hd' <- headFromBlock tp hd
            log "Got new head"
 
-           parseFromTapeHead (hd:closedHeads) (Partial next) hd'
+           r <- parseFromTapeHead (Partial next) hd'
+           closeReadHead (tapeTapeFile tp) hd
+
+           pure r
          else do
            log "parseFromTape block"
-           blockPtr <- newForeignPtr_ (castPtr (tapeHeadCurData hd))
-           let chunk = BS.fromForeignPtr blockPtr 0 (fromIntegral remainingBytes)
 
-           let nextRes = next chunk
+           let chunk = BS.fromForeignPtr foreignData
+                                         (fromIntegral $ tapeHeadBlockOffset hd)
+                                         (fromIntegral remainingBytes)
+               TapeHeadForeign foreignData = tapeHeadForeignData hd
+
+               nextRes = next chunk
                hd' = case nextRes of
                        Partial {} -> hd { tapeHeadBlockOffset = blockSz }
                        Done rem _ -> advanceHead hd (remainingBytes - fromIntegral (BS.length rem))
                        Fail rem _ _ -> advanceHead hd (remainingBytes - fromIntegral (BS.length rem))
 
-           parseFromTapeHead closedHeads nextRes hd'
+           parseFromTapeHead nextRes hd'
 
 runCopierInTape :: HasCallStack => Copier v -> Tape -> Tape -> IO ()
 runCopierInTape copier inputTp outputTp =

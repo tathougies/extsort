@@ -1,19 +1,33 @@
-module Data.External.Sort where
+{-# LANGUAGE CPP #-}
+{-# OPTIONS_GHC -fno-warn-unused-top-binds #-}
 
-import           Prelude hiding (log, read, pred)
+module Data.External.Sort
+  ( Serializers(..), SortOptions(..)
+
+  , externalSort ) where
+
+#include "MachDeps.h"
+
+import           Prelude hiding (log, read, pred, mapM)
 
 import           Data.External.Tape
 
-import           Control.Applicative ((<|>))
 import           Control.DeepSeq (NFData)
 import           Control.Monad (when, unless, forM_, forM, join)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
-import           Control.Monad.Trans.Resource (MonadResource, allocate)
+import           Control.Monad.Trans.Resource (MonadResource, ResourceT, allocate)
 
-import qualified Data.Attoparsec.Binary as Atto (word32be)
+#ifdef WORDS_BIGENDIAN
+import qualified Data.Attoparsec.Binary as Atto (anyWord32be)
+#else
+import qualified Data.Attoparsec.Binary as Atto (anyWord32le)
+#endif
+
 import           Data.Attoparsec.ByteString.Char8 as Atto hiding (take)
 import qualified Data.ByteString.Builder as B
-import           Data.Conduit ((=$=), Conduit, ConduitM, Producer, await, yield)
+import qualified Data.ByteString.Builder.Extra as B
+import           Data.Conduit ((=$=), Conduit, ConduitM, await, yield)
+import           Data.Foldable (msum)
 import           Data.Function (on)
 import           Data.IORef (readIORef, writeIORef)
 import           Data.List (genericReplicate, tails, minimumBy)
@@ -21,25 +35,17 @@ import           Data.Monoid ((<>))
 import qualified Data.Mutable as Mut (IOPRef, newRef, readRef, writeRef, modifyRef')
 import           Data.Ord (comparing)
 import qualified Data.Vector as V
-import qualified Data.Vector.Algorithms.Intro as VIO (sortByBounds)
 import qualified Data.Vector.Algorithms.Heap as VIO (heapify, pop, heapInsert)
+import qualified Data.Vector.Algorithms.Intro as VIO (sortByBounds)
 import qualified Data.Vector.Mutable as VIO
 import           Data.Word (Word8, Word32)
 
 import           Foreign.C.Types
 
-import           GHC.Generics
 import           GHC.Stack
 
 import           System.IO
 import           System.Posix
-
-data SortingEvent k
-    = SortingEventFinished
-    | SortingEventRunDone
-    | SortingEventKey k
-      deriving (Show, Generic)
-instance NFData k => NFData (SortingEvent k)
 
 data Serializers a
     = Serializers
@@ -66,49 +72,19 @@ kMIN_BLOCK_SIZE = 8192
 kBLOCK_ALIGNMENT :: CSize
 kBLOCK_ALIGNMENT = 4096
 
-runMarkerWord, finishedMarkerWord, dataMarkerWord :: Word32
-runMarkerWord = 0x0a0a0a0a
-finishedMarkerWord = 0xF1F1F1F1
-dataMarkerWord = 0xD0D0D0D0
-
-runMarker, finishedMarker, dataMarker :: B.Builder
-runMarker      = B.word32BE runMarkerWord
-finishedMarker = B.word32BE finishedMarkerWord
-dataMarker     = B.word32BE dataMarkerWord
+runSzBuilder :: Word32 -> B.Builder
+runSzBuilder = B.word32Host
 
 -- * Utilities
 
-isSortingFinished :: SortingEvent k -> Bool
-isSortingFinished SortingEventFinished = True
-isSortingFinished _ = False
-
-compareSortingEvent' :: (k -> k -> Ordering)
-                     -> SortingEvent k -> SortingEvent k -> Ordering
-compareSortingEvent' _ SortingEventFinished SortingEventFinished = EQ
-compareSortingEvent' _ SortingEventFinished _  = LT
-compareSortingEvent' _ _ SortingEventFinished = GT
-compareSortingEvent' _ SortingEventRunDone SortingEventRunDone = EQ
-compareSortingEvent' _ SortingEventRunDone _ = LT
-compareSortingEvent' _ _ SortingEventRunDone = GT
-compareSortingEvent' cmp (SortingEventKey a) (SortingEventKey b) = cmp a b
-
-compareSortingEvent :: (k -> k -> Ordering)
-                    -> SortingEvent k -> SortingEvent k -> Ordering
-compareSortingEvent cmp a b =
-  flipOrd (compareSortingEvent' (\a' b' -> cmp a' b') a b)
-  where
-    flipOrd :: Ordering -> Ordering
-    flipOrd EQ = EQ
-    flipOrd LT = GT
-    flipOrd GT = LT
-
-removeAt :: Int -> V.Vector a -> V.Vector a
-removeAt ix = do
-  (before, after) <- V.splitAt ix
-  if V.null after then pure before else pure (before <> V.tail after)
+flipOrd :: Ordering -> Ordering
+flipOrd EQ = EQ
+flipOrd LT = GT
+flipOrd GT = LT
 
 debugMVector :: VIO.IOVector a -> (V.Vector a -> IO ()) -> IO ()
 debugMVector _ _ = pure ()
+--debugMVector v g = g =<< V.freeze v
 
 log, info:: MonadIO m => String -> m ()
 --log = liftIO . hPutStrLn stderr
@@ -128,6 +104,7 @@ kthFibonacci n =
 
 -- * External sort
 
+{-# SPECIALIZE externalSort :: (NFData k, NFData v, Show k) => SortOptions -> (k -> k -> Ordering) -> Serializers k -> Serializers v -> Copier v -> Conduit (k, v) (ResourceT IO) (k, v) #-}
 externalSort :: ( MonadResource m, MonadIO m, NFData k, NFData v, Show k )
              => SortOptions
              -> (k -> k -> Ordering)
@@ -162,6 +139,7 @@ externalSort options cmpKey keySerializers valueSerializers valueCopier =
 
      info "[SORT] Done"
 
+{-# SPECIALIZE sortChunks :: (k -> k -> Ordering) -> Int -> Conduit (k, v) (ResourceT IO) (V.Vector (k, v)) #-}
 sortChunks :: MonadIO m => (k -> k -> Ordering) -> Int
            -> Conduit (k, v) m (V.Vector (k, v))
 sortChunks cmpKey chunkSz = do
@@ -192,32 +170,31 @@ sortChunks cmpKey chunkSz = do
               read (curIdx + 1) v
 
 -- | Read all rows
+{-# SPECIALIZE sourceAllRawRows :: (NFData k, NFData v) => Serializers k -> Serializers v -> Tape -> ConduitM i (k, v) (ResourceT IO) () #-}
 sourceAllRawRows :: (MonadIO m, NFData v, NFData k)
                  => Serializers k -> Serializers v
-                 -> Tape -> Producer m (k, v)
+                 -> Tape -> ConduitM i (k, v) m ()
 sourceAllRawRows keySerializers valueSerializers tp =
-  do res <- liftIO $ parseFromTape rawRowParser tp
-     case res of
-       Left (ctxt, err) -> fail ("sourceAllRows: no parse: " ++ show ctxt ++ ": " ++ err)
-       Right SortingEventFinished -> pure ()
-       Right SortingEventRunDone  ->
-         sourceAllRawRows keySerializers valueSerializers tp
-       Right (SortingEventKey kv) ->
-         do yield kv
-            sourceAllRawRows keySerializers valueSerializers tp
-  where
-    rawRowParser = do
-      event <- sortingEventParser (serialParser keySerializers)
-      case event of
-        SortingEventKey key ->
-          do v <- serialParser valueSerializers
-             pure (SortingEventKey (key, v))
-        SortingEventRunDone ->
-          pure SortingEventRunDone
-        SortingEventFinished ->
-          pure SortingEventFinished
+  do runsLeft <- liftIO (Mut.readRef (tapeRuns tp))
+     if runsLeft == 0
+       then pure ()
+       else do
+         liftIO $ Mut.writeRef (tapeRuns tp) (runsLeft - 1)
+
+         res <- liftIO $ parseFromTape runSzParser tp
+         case res of
+           Left (ctxt, err) -> fail ("sourceAllRows: no parse: " ++ show ctxt ++ ": " ++ err)
+           Right runCount ->
+             let readNRows 0 = sourceAllRawRows keySerializers valueSerializers tp
+                 readNRows n = do
+                   kv <- liftIO (parseFromTape ((,) <$> serialParser keySerializers <*> serialParser valueSerializers) tp)
+                   case kv of
+                     Left (ctxt, err) -> fail ("sourceAllRows: no parse kv: " ++ show ctxt ++ ": " ++ err)
+                     Right kv' -> yield kv' >> readNRows (n - 1)
+             in readNRows runCount
 
 -- | Distribute initial runs
+{-# SPECIALIZE sinkInitialTapes :: SortOptions -> Serializers k -> Serializers v -> TapeFile -> ConduitM (V.Vector (k, v)) o (ResourceT IO) (V.Vector Tape) #-}
 sinkInitialTapes
     :: ( MonadResource m, MonadIO m )
     => SortOptions
@@ -239,9 +216,7 @@ sinkInitialTapes SortOptions { sortOptionsTapes       = tapeCount }
          recs <- Mut.readRef (tapeRuns tape)
 
          let dummies = fromIntegral tapeSz - recs
-             dummyBuilder = mconcat (genericReplicate dummies runMarker) <>
-                            if tapeSz == 0 then runMarker else mempty <>
-                            finishedMarker
+             dummyBuilder = mconcat (genericReplicate dummies (runSzBuilder 0))
 
          writeTapeBuilder tape dummyBuilder
          Mut.writeRef (tapeRuns tape) tapeSz
@@ -251,6 +226,7 @@ sinkInitialTapes SortOptions { sortOptionsTapes       = tapeCount }
      pure tapes
 
   where
+    readRuns _ _ [] = error "impossible"
     readRuns tapes curSz oldSizes@((maxSz, sizes):sizess) = do
       nextTuples <- await
       case nextTuples of
@@ -262,15 +238,14 @@ sinkInitialTapes SortOptions { sortOptionsTapes       = tapeCount }
           (_, outputTape) <-
               liftIO (chooseNextTape tapes sizes')
 
-          let builder = foldMap (\(key, value) -> dataMarker <> serialBuilder keySerializers key <> serialBuilder valueSerializers value) tuples <>
-                        runMarker
+          let builder = runSzBuilder (fromIntegral (V.length tuples)) <>
+                        foldMap (\(key, value) -> serialBuilder keySerializers key <> serialBuilder valueSerializers value) tuples
           liftIO (writeTapeBuilder outputTape builder)
 
           when (curSz == maxSz) $
             info ("Going to use " ++ show maxSz')
 
           readRuns tapes (curSz + 1) nextSizes
-    readRuns _ _ [] = error "impossible"
 
     -- Choose tape with the least utilization
     chooseNextTape tapes sizes = do
@@ -289,7 +264,7 @@ sinkInitialTapes SortOptions { sortOptionsTapes       = tapeCount }
 -- * N-Way merge step
 
 nwayMerges :: forall k v
-            . ( HasCallStack, Show k, NFData k )
+            . ( Show k, NFData k )
            => V.Vector Tape -> Tape
            -> (k -> k -> Ordering)
            -> Serializers k -> Copier v
@@ -300,13 +275,41 @@ nwayMerges tapes initialOutputTape cmpKey keySerializer valueCopier = do
   if V.null nonEmptyTapes
      then pure initialOutputTape
      else do
-       inputs <- mapM (readSortingRow keySerializer) tapes
-       join (nwayMerges' <$> slicedFromVector (compareSortingEvent cmpKey `on` fst) (V.zip inputs tapes)
+       inputs <-
+         fmap msum . forM tapes $ \tp -> do
+           runsLeft <- Mut.readRef (tapeRuns tp)
+
+           if runsLeft == 0
+             then pure mempty
+             else do
+               runSz <- readRunSize tp
+               Mut.writeRef (tapeRecords tp) runSz
+               if runSz == 0
+                  then pure (pure (Nothing, tp))
+                  else pure . (, tp) . Just <$> readKey tp
+
+       join (nwayMerges' <$> slicedFromVector cmpKey' inputs
                          <*> pure initialOutputTape)
 
   where
-    nwayMerges' :: HasCallStack
-                => SlicedVector (SortingEvent k, Tape)
+    cmpKey' (a, _) (b, _) =  flipOrd (cmpMaybe cmpKey a b)
+
+    cmpMaybe :: (a -> a -> Ordering)
+             -> Maybe a -> Maybe a
+             -> Ordering
+    cmpMaybe _ Nothing Nothing = EQ
+    cmpMaybe _ Nothing _ = LT
+    cmpMaybe _ _ Nothing = GT
+    cmpMaybe cmpKey'' (Just a) (Just b) = cmpKey'' a b
+
+    readKey :: Tape -> IO k
+    readKey tp = do
+      r <- parseFromTape (serialParser keySerializer) tp
+      case r of
+        Left (ctxt, err) -> fail ("readKey: no parse " ++ show ctxt ++ ": " ++ err)
+        Right r' -> pure r'
+
+    nwayMerges' :: SlicedVector (Maybe k, Tape)
                 -> Tape -> IO Tape
     nwayMerges' inputs outputTape = do
       (nextOutputTape, inputs') <- nwayMerge' inputs outputTape
@@ -315,8 +318,8 @@ nwayMerges tapes initialOutputTape cmpKey keySerializer valueCopier = do
       debugMVector (sliced inputs') $ \inputs'Frozen ->
         info ("Frozen inputs " ++ show (fmap fst inputs'Frozen))
 
-      inputs'' <- inplaceFilterSlicedM  (compareSortingEvent cmpKey `on` fst)
-                                        ( fmap (> 0) . Mut.readRef . tapeRuns . snd ) inputs'
+      inputs'' <- inplaceFilterSlicedM cmpKey'
+                                       ( fmap (> 0) . Mut.readRef . tapeRuns . snd ) inputs'
 
       debugMVector (sliced inputs'') $ \inputs''Frozen ->
         debugMVector (orig inputs'') $ \origInputs''Frozen ->
@@ -338,25 +341,38 @@ nwayMerges tapes initialOutputTape cmpKey keySerializer valueCopier = do
              Nothing -> pure ()
              Just outputHd' -> closeTapeHead outputHd'
 
-           outRow <- readSortingRow keySerializer outputTape
-           log ("Out row is " ++ show outRow)
-           inputs''' <- slicedPushHeap (compareSortingEvent cmpKey `on` fst) inputs'' (outRow, outputTape)
-           log "Push heap"
+           runsLeft <- Mut.readRef (tapeRuns outputTape)
 
-           nwayMerges' inputs''' nextOutputTape
+           inputs'''' <-
+             if runsLeft == 0
+             then pure inputs''
+             else do
+               outputSz <- readRunSize outputTape
+               Mut.writeRef (tapeRecords outputTape) outputSz
 
-    nwayMerge' :: HasCallStack
-               => SlicedVector (SortingEvent k, Tape) -> Tape
-               -> IO (Tape, SlicedVector (SortingEvent k, Tape))
+               outRow <- if outputSz == 0
+                         then pure Nothing
+                         else Just <$> readKey outputTape
+               log ("Out row is " ++ show outRow)
+               inputs''' <- slicedPushHeap cmpKey' inputs'' (outRow, outputTape)
+               log "Push heap"
+               pure inputs'''
+
+           nwayMerges' inputs'''' nextOutputTape
+
+    nwayMerge' :: SlicedVector (Maybe k, Tape) -> Tape
+               -> IO (Tape, SlicedVector (Maybe k, Tape))
     nwayMerge' inputs outputTape
       | slicedNull inputs = do
           info "Inputs null"
-          writeTapeBuilder outputTape (runMarker <> finishedMarker)
           pure (outputTape, inputs)
 
       | otherwise = do
           debugMVector (sliced inputs) $ \inputsFrozen ->
             log ("Inputs " ++ show (fmap fst inputsFrozen))
+
+          allRecords <- sumSliced inputs $ \(_, tp) -> Mut.readRef (tapeRecords tp)
+          writeTapeBuilder outputTape (runSzBuilder allRecords)
 
           inputs' <- join (mergeRun <$> mkSlicedPair inputs
                                     <*> pure outputTape)
@@ -365,80 +381,94 @@ nwayMerges tapes initialOutputTape cmpKey keySerializer valueCopier = do
             log ("Inputs' " ++ show (fmap fst inputs'Frozen))
 
           Mut.modifyRef' (tapeRuns outputTape) (+1)
-          writeTapeBuilder outputTape runMarker
 
           log "take while start"
-          (finished, alive) <- slicedTakeWhile (compareSortingEvent cmpKey `on` fst) (isSortingFinished . fst) inputs'
+          (lastExcluded, alive) <-
+            slicedFilter cmpKey' inputs' $ \(_, tp) -> do
+              runsLeft <- Mut.readRef (tapeRuns tp)
+
+              -- Release all the non-output tapes that are done now
+              if runsLeft == 0
+                then do
+                  log "Finish tape head"
+                  rdHead <- readIORef (tapeReadingBlock tp)
+                  writeIORef (tapeReadingBlock tp) Nothing
+
+                  case rdHead of
+                    Nothing -> pure ()
+                    Just rdHead' -> closeReadHead (tapeTapeFile tp) rdHead'
+
+                  pure Nothing
+                else do
+                  nextRunSz <- readRunSize tp
+                  Mut.writeRef (tapeRecords tp) nextRunSz
+
+                  if nextRunSz == 0
+                    then pure (Just (Nothing, tp))
+                    else do
+                      nextKey <- readKey tp
+                      pure (Just (Just nextKey, tp))
           log "take while end"
 
-          case finished V.!? 0 of
+          case lastExcluded of
             Nothing -> do
               info "None finish"
               debugMVector (sliced inputs') $ \inputs'Frozen' ->
                 log ("Inputs' frozen after none " ++ show (fmap fst inputs'Frozen'))
               nwayMerge' inputs' outputTape
-            Just (SortingEventFinished, nextOutput) -> do
-              -- Release all the non-output tapes that are done now
-              forM_ finished $ \(s, finishedTp) -> do
-                log ("Finish tape head " ++ show s)
-                rdHead <- readIORef (tapeReadingBlock finishedTp)
-                writeIORef (tapeReadingBlock finishedTp) Nothing
-
-                case rdHead of
-                  Nothing -> pure ()
-                  Just rdHead' -> closeReadHead (tapeTapeFile finishedTp) rdHead'
-
+            Just (_, nextOutput) -> do
               -- We're now done with this tape
-              writeTapeBuilder outputTape finishedMarker
               log "wrote finished"
 
               debugMVector (sliced alive) $ \aliveFrozen ->
                 log ("Alive before loop " ++ show (fmap fst aliveFrozen))
 
               pure (nextOutput, alive)
-            Just _ -> fail "Not finished"
 
     mergeRun :: HasCallStack
-             => SlicedVectorPair (SortingEvent k, Tape)
-             -> Tape -> IO (SlicedVector (SortingEvent k, Tape))
+             => SlicedVectorPair (Maybe k, Tape)
+             -> Tape -> IO (SlicedVector (Maybe k, Tape))
     mergeRun inputsAndDone outputTape = do
       firstInput <- firstSliceHead inputsAndDone
       case firstInput of
         Nothing -> do
           log "mergeRun done"
-          slicedPairTakeSecond (compareSortingEvent cmpKey `on` fst) inputsAndDone
-        Just (SortingEventFinished, _) ->
-          fail "mergeRun: File finished before run done"
-        Just (SortingEventRunDone, tp) -> do
-          x' <- readSortingRow keySerializer tp
-
-          slicedMoveHeadToSecondAndSet (compareSortingEvent cmpKey `on` fst) inputsAndDone (x', tp)
+          slicedPairTakeSecond cmpKey' inputsAndDone
+        Just (Nothing, tp) -> do
+          slicedMoveHeadToSecondAndSet cmpKey' inputsAndDone (Nothing, tp)
           Mut.modifyRef' (tapeRuns tp) (subtract 1)
 
           mergeRun inputsAndDone outputTape
-        Just (SortingEventKey lowestKey, tp) -> do
-          writeTapeBuilder outputTape (dataMarker <> serialBuilder keySerializer lowestKey)
+        Just (Just lowestKey, tp) -> do
+          recordsLeft <- subtract 1 <$> Mut.readRef (tapeRecords tp)
+
+          writeTapeBuilder outputTape (serialBuilder keySerializer lowestKey)
           runCopierInTape valueCopier tp outputTape
 
-          x' <- readSortingRow keySerializer tp
-          slicedPopHeadAndInsertSortedInFirst (compareSortingEvent cmpKey `on` fst) inputsAndDone (x', tp)
+          Mut.writeRef (tapeRecords tp) recordsLeft
+
+          x' <- if recordsLeft == 0
+                then pure Nothing
+                else Just <$> readKey tp
+          slicedPopHeadAndInsertSortedInFirst cmpKey' inputsAndDone (x', tp)
 
           mergeRun inputsAndDone outputTape
 
-readSortingRow :: forall k. NFData k
-               => Serializers k -> Tape
-               -> IO (SortingEvent k)
-readSortingRow (Serializers parser _) tp = do
-  res <- parseFromTape (sortingEventParser parser) tp
-  case res of
-    Left (ctxts, err) -> fail ("readSortingRow.parseFromTape: " ++ show ctxts ++ ": " ++ show err)
-    Right r -> pure r
+readRunSize :: Tape -> IO Word32
+readRunSize tp =
+  do res <- parseFromTape runSzParser tp
+     case res of
+       Left (ctxts, err) ->
+         fail ("readRunSize : parse error: " ++ show ctxts ++ ": " ++ err)
+       Right res' ->
+         pure res'
 
-sortingEventParser :: Parser k -> Parser (SortingEvent k)
-sortingEventParser parser =
-  (SortingEventRunDone  <$  Atto.word32be runMarkerWord) <|>
-  (SortingEventFinished <$  Atto.word32be finishedMarkerWord)  <|>
-  (SortingEventKey      <$> (Atto.word32be dataMarkerWord *> parser))
+runSzParser :: Atto.Parser Word32
+#ifdef WORDS_BIGENDIAN
+runSzParser = Atto.anyWord32be
+#else
+runSzParser = Atto.anyWord32le
+#endif
 
 -- * MaxLength vector
 
@@ -464,7 +494,7 @@ slicedPushHeap :: (a -> a -> Ordering)
                -> SlicedVector a -> a
                -> IO (SlicedVector a)
 slicedPushHeap cmp (SlicedVector o s) a =
-  copy 0
+  go
   where
     slicedLength' = VIO.length s
 
@@ -473,41 +503,47 @@ slicedPushHeap cmp (SlicedVector o s) a =
 
     sliced' = VIO.slice startIdx' (slicedLength' + 1) o
 
-    copy curIdx
-      | curIdx >= slicedLength' = do
-          VIO.heapInsert cmp sliced' 0 slicedLength' a
-          pure (SlicedVector o sliced')
-      | otherwise = do
-          x <- VIO.unsafeRead s curIdx
-          VIO.unsafeWrite sliced' curIdx x
-          copy (curIdx + 1)
+    go = do
+      VIO.unsafeMove (VIO.slice 0 slicedLength' sliced') s
+      VIO.heapInsert cmp sliced' 0 slicedLength' a
+      pure (SlicedVector o sliced')
 
-slicedTakeWhile :: (a -> a -> Ordering)
-                -> (a -> Bool)
-                -> SlicedVector a
-                -> IO (V.Vector a, SlicedVector a)
-slicedTakeWhile cmp pred (SlicedVector o v) =
-  go vLength
+slicedFilter :: (a -> a -> Ordering)
+             -> SlicedVector a
+             -> (a -> IO (Maybe a))
+             -> IO (Maybe a, SlicedVector a)
+slicedFilter cmp (SlicedVector o v) pred =
+  go 0 vLength Nothing
   where
     vLength = VIO.length v
 
-    go 0 = fmap (, SlicedVector o (VIO.slice 0 0 o))
-                (V.freeze v)
-    go n = do
-      keep <- pred <$> VIO.unsafeRead v 0
-      if keep
-        then do
-          VIO.pop cmp v 0 (n - 1)
-          go (n - 1)
-        else do
-          log ("Satisfied start " ++ show (n, vLength))
-          satisfied <- if n >= vLength
-                       then pure mempty
-                       else V.freeze (VIO.slice n (vLength - n) v)
+    go i e lastExcluded
+      | i < e = do
+          x  <- VIO.unsafeRead v i
+          x' <- pred x
+          case x' of
+            Nothing -> go (i + 1) e (Just x)
+            Just e' -> do
+              VIO.unsafeSwap v i (e - 1)
+              VIO.unsafeWrite v (e - 1) e'
+              go i (e - 1) lastExcluded
+      | otherwise = do
+          let v' = VIO.unsafeSlice i (vLength - i) v
+          VIO.heapify cmp v' 0 (vLength - i)
+          pure (lastExcluded, SlicedVector o v')
 
-          let v' = VIO.slice (vLength - n) n v
-          VIO.unsafeMove v' (VIO.slice 0 n v)
-          pure (satisfied, SlicedVector o v')
+sumSliced :: Num o => SlicedVector a -> (a -> IO o) -> IO o
+sumSliced (SlicedVector _ v) f =
+  go 0 0
+  where
+    vLength = VIO.length v
+
+    go n !a
+      | n < vLength = do
+          x <- VIO.unsafeRead v n
+          s <- f x
+          go (n + 1) (a + s)
+      | otherwise = pure a
 
 inplaceFilterSlicedM :: (a -> a -> Ordering)
                      -> (a -> IO Bool)
@@ -524,9 +560,9 @@ inplaceFilterSlicedM cmp pred (SlicedVector o v) =
           keep <- pred =<< VIO.unsafeRead v' 0
           if keep
             then do
-              VIO.swap v' 0 (VIO.length v' - foundLen - 1)
+              VIO.unsafeSwap v' 0 (VIO.length v' - foundLen - 1)
               go v' (foundLen + 1)
-            else go (VIO.tail v') foundLen
+            else go (VIO.unsafeTail v') foundLen
 
 data SlicedVectorPair a
   = SlicedVectorPair
@@ -545,7 +581,7 @@ firstSliceHead (SlicedVectorPair (SlicedVector _ x) firstLenV) = do
 slicedPairTakeSecond :: (a -> a -> Ordering) -> SlicedVectorPair a -> IO (SlicedVector a)
 slicedPairTakeSecond cmp (SlicedVectorPair (SlicedVector orig' v) firstLenV) = do
   firstLen <- Mut.readRef firstLenV
-  let v' = VIO.slice firstLen (VIO.length v - firstLen) v
+  let v' = VIO.unsafeSlice firstLen (VIO.length v - firstLen) v
   VIO.heapify cmp v' 0 (VIO.length v')
   pure (SlicedVector orig' v')
 
@@ -568,9 +604,4 @@ slicedMoveHeadToSecondAndSet cmp (SlicedVectorPair (SlicedVector _ v) firstLenV)
   firstLen <- Mut.readRef firstLenV
   VIO.pop cmp v 0 (firstLen - 1)
   Mut.writeRef firstLenV (firstLen - 1)
-  VIO.write v (firstLen - 1) a
-
-debugFirst :: SlicedVectorPair a -> IO (V.Vector a)
-debugFirst (SlicedVectorPair (SlicedVector _ v) firstLenV) = do
-  firstLen <- Mut.readRef firstLenV
-  V.freeze (VIO.slice 0 firstLen v)
+  VIO.unsafeWrite v (firstLen - 1) a

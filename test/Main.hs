@@ -42,9 +42,9 @@ main :: IO ()
 main = do
   [input] <- getArgs
 
-  let defaultOptions = SortOptions (10 * 1024) 7 10000 "sort.tmp" False
-      intSerializers = Serializers anyWord64le word64LE --Host
-      noSerializer = Serializers (pure ()) (const mempty)
+  let defaultOptions = SortOptions (10 * 1024) 7 100000 "sort.tmp" False
+      intSerializers = Serializers anyWord64le word64LE
+      noSerializer   = Serializers (pure ()) (const mempty)
 
   runResourceT $ runConduit (C.sourceFile input   =$=
                              C.lines              =$=

@@ -4,3 +4,5 @@ dist
 *~
 sort.tmp
 *.prof
+sort.out
+cabal.sandbox.config

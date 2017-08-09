@@ -51,6 +51,9 @@ executable sort-hs
                       TupleSections
                       ScopedTypeVariables
                       RankNTypes
+  if flag(dump-core)
+     build-depends: dump-core
+     ghc-options:  -fplugin=DumpCore -fplugin-opt DumpCore:core-html
   hs-source-dirs: test
   main-is: Main.hs
 

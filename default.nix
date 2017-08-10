@@ -16,7 +16,7 @@ let
    version = "0.0.0.1";
    src = builtins.filterSource (path: type: (baseNameOf path != ".git" && baseNameOf path  != ".cabal-sandbox" && baseNameOf path != "dist" && baseNameOf path != "random") || type != "directory") ./.;
    buildInputs = [
-     (ghcPackages.ghcWithPackages (ghc: [ ghc.bytestring ghc.attoparsec ghc.mtl ghc.resourcet ghc.attoparsec-binary ghc.vector ghc.vector-algorithms ghc.conduit-extra ghc.parallel ghc.pqueue ]))
+     (ghcPackages.ghcWithPackages (ghc: [ ghc.bytestring ghc.attoparsec ghc.mtl ghc.resourcet ghc.attoparsec-binary ghc.vector ghc.vector-algorithms ghc.conduit-extra ghc.parallel ghc.pqueue ghc.mutable-containers ]))
      ];
    };
 

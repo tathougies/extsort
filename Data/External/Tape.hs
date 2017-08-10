@@ -166,8 +166,8 @@ rewindTape tape = do
     Nothing -> pure ()
     Just writeHead' -> do
       log ("Rewind at " ++ show (tapeHeadFileBlock writeHead'))
-
       setNextBlock tape writeHead' lastBlock
+      closeTapeHead writeHead'
 
   case rdHead of
     Nothing -> writeIORef (tapeReadingBlock tape) Nothing

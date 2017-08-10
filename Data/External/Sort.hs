@@ -12,10 +12,11 @@ import           Prelude hiding (log, read, pred, mapM)
 
 import           Data.External.Tape
 
+import           Control.Arrow
 import           Control.DeepSeq (NFData)
 import           Control.Monad (when, unless, forM_, forM, join)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
-import           Control.Monad.Trans.Resource (MonadResource, ResourceT, allocate)
+import           Control.Monad.Trans.Resource (MonadResource, ResourceT) --, allocate)
 
 #ifdef WORDS_BIGENDIAN
 import qualified Data.Attoparsec.Binary as Atto (anyWord32be)
@@ -26,9 +27,9 @@ import qualified Data.Attoparsec.Binary as Atto (anyWord32le)
 import           Data.Attoparsec.ByteString.Char8 as Atto hiding (take)
 import qualified Data.ByteString.Builder as B
 import qualified Data.ByteString.Builder.Extra as B
-import           Data.Conduit ((=$=), Conduit, ConduitM, await, yield)
+--import           Data.Conduit ((=$=), Conduit, ConduitM, await, yield)
 import           Data.Foldable (msum)
-import           Data.Function (on)
+import           Data.Function (on, (&))
 import           Data.IORef (readIORef, writeIORef)
 import           Data.List (genericReplicate, tails, minimumBy)
 import           Data.Monoid ((<>))
@@ -43,6 +44,8 @@ import           Data.Word (Word8, Word32)
 import           Foreign.C.Types
 
 import           GHC.Stack
+
+import           Streaming
 
 import           System.IO
 import           System.Posix
@@ -104,15 +107,19 @@ kthFibonacci n =
 
 -- * External sort
 
-{-# SPECIALIZE externalSort :: (NFData k, NFData v, Show k) => SortOptions -> (k -> k -> Ordering) -> Serializers k -> Serializers v -> Copier v -> Conduit (k, v) (ResourceT IO) (k, v) #-}
+{-# SPECIALIZE externalSort :: (NFData k, NFData v, Show k)
+                            => SortOptions -> (k -> k -> Ordering) -> Serializers k -> Serializers v
+                            -> Copier v -> Stream (Of (k, v)) (ResourceT IO) a
+                            -> Stream (Of (k, v)) (ResourceT IO) () #-}
 externalSort :: ( MonadResource m, MonadIO m, NFData k, NFData v, Show k )
              => SortOptions
              -> (k -> k -> Ordering)
              -> Serializers k
              -> Serializers v
              -> Copier v
-             -> Conduit (k, v) m (k, v)
-externalSort options cmpKey keySerializers valueSerializers valueCopier =
+             -> Stream (Of (k, v)) m a
+             -> Stream (Of (k, v)) m ()
+externalSort options cmpKey keySerializers valueSerializers valueCopier input =
   do let unalignedBlockSize = (sortOptionsWorkingMem options * 1024) `div`
                               fromIntegral (sortOptionsTapes options)
          blockSize = ((unalignedBlockSize + kBLOCK_ALIGNMENT - 1) `div` kBLOCK_ALIGNMENT) *
@@ -120,96 +127,101 @@ externalSort options cmpKey keySerializers valueSerializers valueCopier =
 
      when (blockSize <= kMIN_BLOCK_SIZE) (fail "externalSort: Not enough space")
 
-     (_, tapeFile) <- allocate (openTapeFile (sortOptionsWorkingFile options) blockSize) closeTapeFile
-     unless (sortOptionsPersistFile options) $
-       liftIO (removeLink (sortOptionsWorkingFile options))
+     bracketStream (openTapeFile (sortOptionsWorkingFile options) blockSize)
+                   closeTapeFile $ \tapeFile -> do
+       unless (sortOptionsPersistFile options) $
+         liftIO (removeLink (sortOptionsWorkingFile options))
 
-     info "[SORT] Reading input"
-     tapes <- sortChunks cmpKey (sortOptionsChunkSize options) =$=
-              sinkInitialTapes options keySerializers valueSerializers tapeFile
+       info "[SORT] Reading input"
+       tapes <- lift (sinkInitialTapes options keySerializers valueSerializers tapeFile .
+                       sortChunks cmpKey (sortOptionsChunkSize options) $ input)
 
-     info "[SORT] [MERGE] Starting..."
-     outputTape <-
-         liftIO $ do
-           forM_ (V.tail tapes) rewindTape
-           nwayMerges (V.tail tapes) (V.head tapes) cmpKey keySerializers valueCopier
-     info "[SORT] [MERGE] Done..."
+       info "[SORT] [MERGE] Starting..."
+       outputTape <-
+           liftIO $ do
+             forM_ (V.tail tapes) rewindTape
+             nwayMerges (V.tail tapes) (V.head tapes) cmpKey keySerializers valueCopier
+       info "[SORT] [MERGE] Done..."
 
-     sourceAllRawRows keySerializers valueSerializers outputTape
+       sourceAllRawRows keySerializers valueSerializers outputTape
 
-     info "[SORT] Done"
+       info "[SORT] Done"
 
-{-# SPECIALIZE sortChunks :: (k -> k -> Ordering) -> Int -> Conduit (k, v) (ResourceT IO) (V.Vector (k, v)) #-}
+{-# SPECIALIZE sortChunks :: (k -> k -> Ordering) -> Int
+                          -> Stream (Of (k, v)) (ResourceT IO) a
+                          -> Stream (Compose (Of Int) (Stream (Of (k, v)) (ResourceT IO))) (ResourceT IO) a #-}
 sortChunks :: MonadIO m => (k -> k -> Ordering) -> Int
-           -> Conduit (k, v) m (V.Vector (k, v))
-sortChunks cmpKey chunkSz = do
+           -> Stream (Of (k, v)) m a
+           -> Stream (Compose (Of Int) (Stream (Of (k, v)) m)) m a
+sortChunks cmpKey chunkSz inputs = do
   v <- liftIO (VIO.new chunkSz)
 
-  tuplesRead <- read 0 v
+  inputs & (chunksOf chunkSz >>>
+            mapsM (\s -> streamFold (\res tuplesRead -> do
+                                        liftIO (info "Read chunk")
+                                        liftIO (VIO.sortByBounds (cmpKey `on` fst) v 0 tuplesRead)
+                                        pure (Compose (tuplesRead :>
+                                                       (unfold (\curIdx ->
+                                                                  if curIdx >= tuplesRead
+                                                                  then pure (Left res)
+                                                                  else Right . (:> (curIdx + 1)) <$>
+                                                                       liftIO (VIO.unsafeRead v curIdx)) 0 ))))
+                                    (\action i -> do
+                                        next <- action
+                                        next i)
+                                    (\(cur :> next) i -> do
+                                        liftIO (VIO.unsafeWrite v i cur)
+                                        next (i +1)) s 0))
 
-  v'' <- liftIO $ do
-           VIO.sortByBounds (cmpKey `on` fst) v 0 tuplesRead
-           let v' = VIO.slice 0 tuplesRead v
-           V.unsafeFreeze v'
-
-  yield v''
-
-  if tuplesRead < chunkSz
-     then pure ()
-     else sortChunks cmpKey chunkSz
-
-  where
-    read curIdx v
-      | curIdx == chunkSz = pure curIdx
-      | otherwise = do
-          x <- await
-          case x of
-            Nothing -> pure curIdx
-            Just row -> do
-              liftIO (VIO.write v curIdx row)
-              read (curIdx + 1) v
-
+{-# SPECIALIZE sourceAllRawRows :: (NFData k, NFData v) => Serializers k -> Serializers v
+                                -> Tape -> Stream (Of (k, v)) (ResourceT IO) () #-}
 -- | Read all rows
-{-# SPECIALIZE sourceAllRawRows :: (NFData k, NFData v) => Serializers k -> Serializers v -> Tape -> ConduitM i (k, v) (ResourceT IO) () #-}
 sourceAllRawRows :: (MonadIO m, NFData v, NFData k)
                  => Serializers k -> Serializers v
-                 -> Tape -> ConduitM i (k, v) m ()
+                 -> Tape
+                 -> Stream (Of (k, v)) m ()
 sourceAllRawRows keySerializers valueSerializers tp =
-  do runsLeft <- liftIO (Mut.readRef (tapeRuns tp))
-     if runsLeft == 0
-       then pure ()
-       else do
-         liftIO $ Mut.writeRef (tapeRuns tp) (runsLeft - 1)
+  concats .
+  flip unfold () $ \() -> do
+  runsLeft <- liftIO (Mut.readRef (tapeRuns tp))
+  if runsLeft == 0
+    then pure (Left ())
+    else do
+      liftIO $ Mut.writeRef (tapeRuns tp) (runsLeft - 1)
 
-         res <- liftIO $ parseFromTape runSzParser tp
-         case res of
-           Left (ctxt, err) -> fail ("sourceAllRows: no parse: " ++ show ctxt ++ ": " ++ err)
-           Right runCount ->
-             let readNRows 0 = sourceAllRawRows keySerializers valueSerializers tp
-                 readNRows n = do
-                   kv <- liftIO (parseFromTape ((,) <$> serialParser keySerializers <*> serialParser valueSerializers) tp)
-                   case kv of
-                     Left (ctxt, err) -> fail ("sourceAllRows: no parse kv: " ++ show ctxt ++ ": " ++ err)
-                     Right kv' -> yield kv' >> readNRows (n - 1)
-             in readNRows runCount
+      res <- liftIO $ parseFromTape runSzParser tp
+      case res of
+        Left (ctxt, err) -> fail ("sourceAllRows: no parse: " ++ show ctxt ++ ": " ++ err)
+        Right tupleCount ->
+          pure . Right $
+          flip unfold tupleCount $ \n ->
+            if n == 0 then pure (Left ())
+            else do
+              kv <- liftIO (parseFromTape ((,) <$> serialParser keySerializers <*> serialParser valueSerializers) tp)
+              case kv of
+                Left (ctxt, err) -> fail ("sourceAllRows: no parse kv: " ++ show ctxt ++ ": " ++ err)
+                Right kv' -> pure (Right (kv' :> n - 1))
 
+{-# SPECIALIZE sinkInitialTapes :: SortOptions -> Serializers k -> Serializers v
+                                -> TapeFile -> Stream (Compose (Of Int) (Stream (Of (k, v)) (ResourceT IO))) (ResourceT IO) x
+                                -> ResourceT IO (V.Vector Tape) #-}
 -- | Distribute initial runs
-{-# SPECIALIZE sinkInitialTapes :: SortOptions -> Serializers k -> Serializers v -> TapeFile -> ConduitM (V.Vector (k, v)) o (ResourceT IO) (V.Vector Tape) #-}
 sinkInitialTapes
     :: ( MonadResource m, MonadIO m )
     => SortOptions
     -> Serializers k
     -> Serializers v
     -> TapeFile
-    -> ConduitM (V.Vector (k, v)) o m (V.Vector Tape)
-sinkInitialTapes SortOptions { sortOptionsTapes       = tapeCount }
+    -> Stream (Compose (Of Int) (Stream (Of (k, v)) m)) m x
+    -> m (V.Vector Tape)
+sinkInitialTapes SortOptions { sortOptionsTapes = tapeCount }
                  keySerializers valueSerializers
-                 tapeFile =
+                 tapeFile inputs =
   do tapes <- liftIO (V.replicateM (fromIntegral tapeCount) (openTape tapeFile))
 
      let sizes = kthFibonacci (fromIntegral (tapeCount - 1))
 
-     (totalSz, outputTapeSizes) <- readRuns tapes 0 sizes
+     (totalSz, outputTapeSizes) <- readRuns inputs tapes 0 sizes
 
      -- Add dummy runs
      liftIO . forM_ (V.zip (V.fromList outputTapeSizes) (V.tail tapes)) $ \(tapeSz, tape) -> do
@@ -226,26 +238,55 @@ sinkInitialTapes SortOptions { sortOptionsTapes       = tapeCount }
      pure tapes
 
   where
-    readRuns _ _ [] = error "impossible"
-    readRuns tapes curSz oldSizes@((maxSz, sizes):sizess) = do
-      nextTuples <- await
-      case nextTuples of
-        Nothing -> pure (maxSz, sizes)
-        Just tuples -> do
-          let (nextSizes, (maxSz', sizes')) =
-                  if curSz == maxSz then (sizess, head sizess) else (oldSizes, (maxSz, sizes))
+    readRuns =
+      streamFold (\_ _ _ sizes ->
+                    case sizes of
+                      [] -> error "impossible"
+                      (maxSz,sizes'):_ -> pure (maxSz, sizes'))
+                 (\action tapes curSz sizes -> do
+                     next <- action
+                     next tapes curSz sizes)
+                 (\(Compose (runSz :> runStream)) tapes curSz oldSizes ->
+                    case oldSizes of
+                      [] -> error "impossible"
+                      ((maxSz, sizes):sizess) -> do
+                        let (nextSizes, (maxSz', sizes')) =
+                              if curSz == maxSz then (sizess, head sizess) else (oldSizes, (maxSz, sizes))
 
-          (_, outputTape) <-
-              liftIO (chooseNextTape tapes sizes')
+                        (_, outputTape) <-
+                          liftIO (chooseNextTape tapes sizes')
 
-          let builder = runSzBuilder (fromIntegral (V.length tuples)) <>
-                        foldMap (\(key, value) -> serialBuilder keySerializers key <> serialBuilder valueSerializers value) tuples
-          liftIO (writeTapeBuilder outputTape builder)
+                        liftIO (writeTapeBuilder outputTape (runSzBuilder (fromIntegral runSz)))
 
-          when (curSz == maxSz) $
-            info ("Going to use " ++ show maxSz')
+                        next <- iterT (\((key, value) :> next') -> do
+                                          liftIO (writeTapeBuilder outputTape (serialBuilder keySerializers key <> serialBuilder valueSerializers value))
+                                          next') runStream
 
-          readRuns tapes (curSz + 1) nextSizes
+                        when (curSz == maxSz) $
+                          info ("Going to use " ++ show maxSz')
+
+                        next tapes (curSz + 1) nextSizes)
+
+--    readRuns _ _ [] = error "impossible"
+--    readRuns tapes curSz oldSizes@((maxSz, sizes):sizess) = do
+--      nextTuples <- await
+--      case nextTuples of
+--        Nothing -> pure (maxSz, sizes)
+--        Just tuples -> do
+--          let (nextSizes, (maxSz', sizes')) =
+--                  if curSz == maxSz then (sizess, head sizess) else (oldSizes, (maxSz, sizes))
+--
+--          (_, outputTape) <-
+--              liftIO (chooseNextTape tapes sizes')
+--
+--          let builder = runSzBuilder (fromIntegral (V.length tuples)) <>
+--                        foldMap (\(key, value) -> serialBuilder keySerializers key <> serialBuilder valueSerializers value) tuples
+--          liftIO (writeTapeBuilder outputTape builder)
+--
+--          when (curSz == maxSz) $
+--            info ("Going to use " ++ show maxSz')
+--
+--          readRuns tapes (curSz + 1) nextSizes
 
     -- Choose tape with the least utilization
     chooseNextTape tapes sizes = do

@@ -15,7 +15,7 @@ library
                  attoparsec, deepseq, parallel,
                  conduit, resourcet, mtl, unix,
                  pqueue, conduit-extra, attoparsec-binary,
-                 mutable-containers
+                 mutable-containers, streaming
   ghc-options: -O3 -funbox-strict-fields -Wall -Werror -fprof-auto
   default-language: Haskell2010
   default-extensions: DeriveGeneric
@@ -42,7 +42,10 @@ executable sort-hs
                  conduit, resourcet,
                  conduit-extra,
                  bytestring, attoparsec,
-                 attoparsec-binary
+                 attoparsec-binary,
+                 streaming-utils,
+                 streaming-bytestring,
+                 streaming
   ghc-options: -threaded -O3 -funbox-strict-fields -Wall -Werror
   default-language: Haskell2010
   default-extensions: DeriveGeneric

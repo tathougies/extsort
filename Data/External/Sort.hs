@@ -633,7 +633,7 @@ slicedPopHeadAndInsertSortedInFirst
   -> SlicedVectorPair a -> a
   -> IO ()
 slicedPopHeadAndInsertSortedInFirst cmp (SlicedVectorPair (SlicedVector _ v) firstLenV) new = do
-  firstLen <- Mut.readRef firstLenV
+  !firstLen <- Mut.readRef firstLenV
   VIO.pop cmp v 0 (firstLen - 1)
   VIO.heapInsert cmp v 0 (firstLen - 1) new
 

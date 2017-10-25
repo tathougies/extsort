@@ -264,7 +264,7 @@ writeTapeGeneric tp go = do
              pure hd'
            Just hd' -> pure hd'
 
-  (x, hd'') <- go hd'
+  (x, !hd'') <- go hd'
 
   writeIORef (tapeWritingBlock tp) (Just hd'')
   pure x
@@ -275,7 +275,7 @@ writeTapeBuilder tp builder =
   where
     maxMoreSize = 4096
 
-    go writer hd =
+    go writer !hd =
       let szLeft = tapeHeadSizeLeft tp hd
       in if szLeft == 0
          then do

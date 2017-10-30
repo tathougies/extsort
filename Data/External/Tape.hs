@@ -414,7 +414,7 @@ parseFromTape parser tp =
 runCopierInTape :: HasCallStack => Copier v -> Tape -> Tape -> IO ()
 runCopierInTape copier inputTp outputTp =
   writeTapeGeneric outputTp $ \outputHd ->
-  withReadHead outputTp $ \readHd ->
+  withReadHead inputTp $ \readHd ->
   doCopy copier readHd outputHd
 
   where

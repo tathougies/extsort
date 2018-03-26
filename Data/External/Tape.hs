@@ -155,6 +155,7 @@ nextBlock tp hd = peek (castPtr (tapeHeadData hd `plusSize` tapeUsefulBlockSize 
 setNextBlock :: Tape -> TapeHead 'Writing -> FileBlock -> IO ()
 setNextBlock tp hd = poke (castPtr (tapeHeadData hd `plusSize` tapeUsefulBlockSize tp))
 
+{-# INLINE rewindTape #-}
 rewindTape :: Tape -> IO ()
 rewindTape tape = do
   writeHead <- readIORef (tapeWritingBlock tape)
@@ -205,6 +206,10 @@ allocateNextBlock tpFl = do
              (tapeFileHandle tpFl) (fromIntegral blkNum * tapeFileBlockSize tpFl)
 
   when (mappedPtr == nullPtr) (throwErrno "allocateNextBlock.mmap")
+
+  madvise mappedPtr (tapeFileBlockSize tpFl) kMADV_SEQUENTIAL
+  madvise mappedPtr (tapeFileBlockSize tpFl) kMADV_WILLNEED
+
   log ("Allocate next block " ++ show nextAllocatedBlock)
 
   pure (nextAllocatedBlock, mappedPtr, tapeFileBlockSize tpFl)
@@ -245,6 +250,7 @@ closeTapeHead hd = do
 
 -- ** Output with tape heads
 
+{-# INLINE writeTapeGeneric #-}
 writeTapeGeneric :: Tape -> (TapeHead 'Writing -> IO (a, TapeHead 'Writing)) -> IO a
 writeTapeGeneric tp go = do
   hd <- readIORef (tapeWritingBlock tp)
@@ -269,6 +275,7 @@ writeTapeGeneric tp go = do
   writeIORef (tapeWritingBlock tp) (Just hd'')
   pure x
 
+{-# INLINE writeTapeBuilder #-}
 writeTapeBuilder :: Tape -> B.Builder -> IO ()
 writeTapeBuilder tp builder =
   writeTapeGeneric tp (go (B.runBuilder builder))
@@ -351,6 +358,9 @@ headFromBlock' tp seqNum (FileBlock nextBlockNumber) =
                          hdl (fromIntegral nextBlockNumber * tapeFileBlockSize fl)
      when (mappedPtr == nullPtr) (throwErrno "headFromBlock.mmap")
 
+     madvise mappedPtr (tapeFileBlockSize fl) kMADV_SEQUENTIAL
+     madvise mappedPtr (tapeFileBlockSize fl) kMADV_WILLNEED
+
      log ("Head from block mapped " ++ show mappedPtr)
 
      foreignPtr <- newForeignPtr_ (castPtr mappedPtr)
@@ -366,6 +376,7 @@ withReadHead tp go =
             writeIORef (tapeReadingBlock tp) (Just rdHead'')
             pure x
 
+{-# INLINE parseFromTape #-}
 parseFromTape :: (HasCallStack, NFData k)
               => Atto.Parser k -> Tape
               -> IO (Either ([String], String) k)
@@ -411,6 +422,7 @@ parseFromTape parser tp =
 
            parseFromTapeHead nextRes hd'
 
+{-# INLINE runCopierInTape #-}
 runCopierInTape :: HasCallStack => Copier v -> Tape -> Tape -> IO ()
 runCopierInTape copier inputTp outputTp =
   writeTapeGeneric outputTp $ \outputHd ->
@@ -452,6 +464,18 @@ kPROT_READ = MmapProtection 0x1
 kPROT_WRITE = MmapProtection 0x2
 kPROT_EXEC = MmapProtection 0x4
 
+newtype MAdvice = MAdvice CInt deriving Show
+
+kMADV_SEQUENTIAL, kMADV_WILLNEED :: MAdvice
+kMADV_SEQUENTIAL = MAdvice 2
+kMADV_WILLNEED = MAdvice 3
+
+madvise :: Ptr a -> CSize -> MAdvice -> IO ()
+madvise ptr sz adv =
+  throwErrnoIf_ (==(-1)) "madvise() failed:"
+    (c_madvise (castPtr ptr) sz adv)
+
 foreign import ccall "unistd.h ftruncate" c_ftruncate :: Fd -> CSize -> IO CInt
 foreign import ccall "sys/mman.h mmap" c_mmap :: Ptr () -> CSize -> MmapProtection -> CInt -> Fd -> CSize -> IO (Ptr ())
 foreign import ccall "sys/mman.h munmap" c_munmap :: Ptr () -> CSize -> IO CInt
+foreign import ccall "sys/mman.h madvise" c_madvise :: Ptr () -> CSize -> MAdvice -> IO CInt

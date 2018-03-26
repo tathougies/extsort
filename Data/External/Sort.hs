@@ -16,7 +16,6 @@ import           Control.Arrow
 import           Control.DeepSeq (NFData)
 import           Control.Monad (when, unless, forM_, forM, join)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
-import           Control.Monad.Trans.Resource (MonadResource, ResourceT) --, allocate)
 
 #ifdef WORDS_BIGENDIAN
 import qualified Data.Attoparsec.Binary as Atto (anyWord32be)
@@ -109,9 +108,10 @@ kthFibonacci n =
 
 {-# SPECIALIZE externalSort :: (NFData k, NFData v, Show k)
                             => SortOptions -> (k -> k -> Ordering) -> Serializers k -> Serializers v
-                            -> Copier v -> Stream (Of (k, v)) (ResourceT IO) a
-                            -> Stream (Of (k, v)) (ResourceT IO) () #-}
-externalSort :: ( MonadResource m, MonadIO m, NFData k, NFData v, Show k )
+                            -> Copier v -> Stream (Of (k, v)) IO a
+                            -> Stream (Of (k, v)) IO () #-}
+{-# INLINE externalSort #-}
+externalSort :: ( MonadIO m, NFData k, NFData v, Show k )
              => SortOptions
              -> (k -> k -> Ordering)
              -> Serializers k
@@ -127,29 +127,31 @@ externalSort options cmpKey keySerializers valueSerializers valueCopier input =
 
      when (blockSize <= kMIN_BLOCK_SIZE) (fail "externalSort: Not enough space")
 
-     bracketStream (openTapeFile (sortOptionsWorkingFile options) blockSize)
-                   closeTapeFile $ \tapeFile -> do
+     tapeFile <- liftIO $ do
+       fl <- openTapeFile (sortOptionsWorkingFile options) blockSize
        unless (sortOptionsPersistFile options) $
          liftIO (removeLink (sortOptionsWorkingFile options))
+       pure fl
 
-       info "[SORT] Reading input"
-       tapes <- lift (sinkInitialTapes options keySerializers valueSerializers tapeFile .
-                       sortChunks cmpKey (sortOptionsChunkSize options) $ input)
+     info "[SORT] Reading input"
+     tapes <- lift (sinkInitialTapes options keySerializers valueSerializers tapeFile .
+                     sortChunks cmpKey (sortOptionsChunkSize options) $ input)
 
-       info "[SORT] [MERGE] Starting..."
-       outputTape <-
-           liftIO $ do
-             forM_ (V.tail tapes) rewindTape
-             nwayMerges (V.tail tapes) (V.head tapes) cmpKey keySerializers valueCopier
-       info "[SORT] [MERGE] Done..."
+     info "[SORT] [MERGE] Starting..."
+     outputTape <-
+         liftIO $ do
+           forM_ (V.tail tapes) rewindTape
+           nwayMerges (V.tail tapes) (V.head tapes) cmpKey keySerializers valueCopier
+     info "[SORT] [MERGE] Done..."
 
-       sourceAllRawRows keySerializers valueSerializers outputTape
+     sourceAllRawRows keySerializers valueSerializers outputTape
 
-       info "[SORT] Done"
+     info "[SORT] Done"
 
 {-# SPECIALIZE sortChunks :: (k -> k -> Ordering) -> Int
-                          -> Stream (Of (k, v)) (ResourceT IO) a
-                          -> Stream (Compose (Of Int) (Stream (Of (k, v)) (ResourceT IO))) (ResourceT IO) a #-}
+                          -> Stream (Of (k, v)) IO a
+                          -> Stream (Compose (Of Int) (Stream (Of (k, v)) IO)) IO a #-}
+{-# INLINE sortChunks #-}
 sortChunks :: MonadIO m => (k -> k -> Ordering) -> Int
            -> Stream (Of (k, v)) m a
            -> Stream (Compose (Of Int) (Stream (Of (k, v)) m)) m a
@@ -174,7 +176,7 @@ sortChunks cmpKey chunkSz inputs = do
                                         next (i +1)) s 0))
 
 {-# SPECIALIZE sourceAllRawRows :: (NFData k, NFData v) => Serializers k -> Serializers v
-                                -> Tape -> Stream (Of (k, v)) (ResourceT IO) () #-}
+                                -> Tape -> Stream (Of (k, v)) IO () #-}
 -- | Read all rows
 sourceAllRawRows :: (MonadIO m, NFData v, NFData k)
                  => Serializers k -> Serializers v
@@ -187,9 +189,9 @@ sourceAllRawRows keySerializers valueSerializers tp =
   if runsLeft == 0
     then pure (Left ())
     else do
-      liftIO $ Mut.writeRef (tapeRuns tp) (runsLeft - 1)
-
-      res <- liftIO $ parseFromTape runSzParser tp
+      res <- liftIO $ do
+        Mut.writeRef (tapeRuns tp) (runsLeft - 1)
+        parseFromTape runSzParser tp
       case res of
         Left (ctxt, err) -> fail ("sourceAllRows: no parse: " ++ show ctxt ++ ": " ++ err)
         Right tupleCount ->
@@ -203,11 +205,12 @@ sourceAllRawRows keySerializers valueSerializers tp =
                 Right kv' -> pure (Right (kv' :> n - 1))
 
 {-# SPECIALIZE sinkInitialTapes :: SortOptions -> Serializers k -> Serializers v
-                                -> TapeFile -> Stream (Compose (Of Int) (Stream (Of (k, v)) (ResourceT IO))) (ResourceT IO) x
-                                -> ResourceT IO (V.Vector Tape) #-}
+                                -> TapeFile -> Stream (Compose (Of Int) (Stream (Of (k, v)) IO)) IO x
+                                -> IO (V.Vector Tape) #-}
+{-# INLINE sinkInitialTapes #-}
 -- | Distribute initial runs
 sinkInitialTapes
-    :: ( MonadResource m, MonadIO m )
+    :: MonadIO m
     => SortOptions
     -> Serializers k
     -> Serializers v
@@ -304,6 +307,7 @@ sinkInitialTapes SortOptions { sortOptionsTapes = tapeCount }
 
 -- * N-Way merge step
 
+{-# INLINE nwayMerges #-}
 nwayMerges :: forall k v
             . ( Show k, NFData k )
            => V.Vector Tape -> Tape
@@ -607,8 +611,8 @@ inplaceFilterSlicedM cmp pred (SlicedVector o v) =
 
 data SlicedVectorPair a
   = SlicedVectorPair
-  { origSliced   :: SlicedVector a
-  , firstLength  :: Mut.IOPRef Int }
+  { origSliced   :: {-# UNPACK #-} !(SlicedVector a)
+  , firstLength  :: {-# UNPACK #-} !(Mut.IOPRef Int) }
 
 mkSlicedPair :: SlicedVector a -> IO (SlicedVectorPair a)
 mkSlicedPair sliced' = SlicedVectorPair sliced' <$> Mut.newRef (slicedLength sliced')

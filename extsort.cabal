@@ -6,17 +6,16 @@ author: Travis Athougies
 maintainer: travis@athougies.net
 category: Web
 build-type: Simple
-cabal-version: >=1.10
+cabal-version: >=1.12
 
 library
   build-depends: base >=4.7 && <5.0,
                  bytestring >=0.10 && <0.11,
                  vector, vector-algorithms,
-                 attoparsec, deepseq, parallel,
-                 conduit, resourcet, mtl, unix,
-                 pqueue, conduit-extra, attoparsec-binary,
+                 attoparsec, deepseq, parallel, mtl, unix,
+                 pqueue, attoparsec-binary,
                  mutable-containers, streaming
-  ghc-options: -O3 -funbox-strict-fields -Wall -Werror -fprof-auto
+  ghc-options: -O3 -funbox-strict-fields -Wall -Werror -fprof-auto -fno-warn-deprecated-flags
   default-language: Haskell2010
   default-extensions: DeriveGeneric
                       GeneralizedNewtypeDeriving
@@ -39,14 +38,12 @@ library
 executable sort-hs
   build-depends: base >=4.7 && <5.0,
                  extsort,
-                 conduit, resourcet,
-                 conduit-extra,
                  bytestring, attoparsec,
                  attoparsec-binary,
                  streaming-utils,
                  streaming-bytestring,
                  streaming
-  ghc-options: -threaded -O3 -funbox-strict-fields -Wall -Werror
+  ghc-options: -threaded -O3 -funbox-strict-fields -Wall -Werror -fno-warn-deprecated-flags
   default-language: Haskell2010
   default-extensions: DeriveGeneric
                       GeneralizedNewtypeDeriving

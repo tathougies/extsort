@@ -33,7 +33,6 @@ import qualified Data.ByteString.Builder as B
 import qualified Data.ByteString.Builder.Extra as B
 import qualified Data.ByteString.Internal as BS (toForeignPtr, fromForeignPtr)
 import           Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef')
-import           Data.Monoid ((<>))
 import qualified Data.PQueue.Min as PQ
 import qualified Data.Mutable as Mut
 import           Data.Word
@@ -457,7 +456,9 @@ runCopierInTape copier inputTp outputTp =
 newtype MmapProtection = MmapProtection CInt deriving Show
 instance Monoid MmapProtection where
     mempty = MmapProtection 0
-    mappend (MmapProtection a) (MmapProtection b) = MmapProtection (a .|. b)
+
+instance Semigroup MmapProtection where
+    MmapProtection a <> MmapProtection b = MmapProtection (a .|. b)
 
 kPROT_EXEC, kPROT_READ, kPROT_WRITE :: MmapProtection
 kPROT_READ = MmapProtection 0x1

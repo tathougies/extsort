@@ -1,12 +1,12 @@
+cabal-version: 2.2
 name: extsort
 version: 0.1.0.0
-license: AllRightsReserved
 license-file: LICENSE
 author: Travis Athougies
 maintainer: travis@athougies.net
 category: Web
 build-type: Simple
-cabal-version: >=1.12
+
 
 library
   build-depends: base >=4.7 && <5.0,
@@ -40,7 +40,7 @@ executable sort-hs
                  extsort,
                  bytestring, attoparsec,
                  attoparsec-binary,
-                 streaming-utils,
+                 streaming-attoparsec,
                  streaming-bytestring,
                  streaming
   ghc-options: -threaded -O3 -funbox-strict-fields -Wall -Werror -fno-warn-deprecated-flags

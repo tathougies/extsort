@@ -14,8 +14,7 @@ import           Data.External.Tape
 
 import           Control.Arrow
 import           Control.DeepSeq (NFData)
-import           Control.Monad (when, unless, forM_, forM, join)
-import           Control.Monad.IO.Class (MonadIO, liftIO)
+import           Control.Monad (when, unless, forM_, forM)
 
 #ifdef WORDS_BIGENDIAN
 import qualified Data.Attoparsec.Binary as Atto (anyWord32be)
@@ -31,7 +30,6 @@ import           Data.Foldable (msum)
 import           Data.Function (on, (&))
 import           Data.IORef (readIORef, writeIORef)
 import           Data.List (genericReplicate, tails, minimumBy)
-import           Data.Monoid ((<>))
 import qualified Data.Mutable as Mut (IOPRef, newRef, readRef, writeRef, modifyRef')
 import           Data.Ord (comparing)
 import qualified Data.Vector as V
@@ -111,7 +109,7 @@ kthFibonacci n =
                             -> Copier v -> Stream (Of (k, v)) IO a
                             -> Stream (Of (k, v)) IO () #-}
 {-# INLINE externalSort #-}
-externalSort :: ( MonadIO m, NFData k, NFData v, Show k )
+externalSort :: ( MonadIO m, MonadFail m, NFData k, NFData v, Show k )
              => SortOptions
              -> (k -> k -> Ordering)
              -> Serializers k
@@ -178,7 +176,7 @@ sortChunks cmpKey chunkSz inputs = do
 {-# SPECIALIZE sourceAllRawRows :: (NFData k, NFData v) => Serializers k -> Serializers v
                                 -> Tape -> Stream (Of (k, v)) IO () #-}
 -- | Read all rows
-sourceAllRawRows :: (MonadIO m, NFData v, NFData k)
+sourceAllRawRows :: (MonadIO m, MonadFail m, NFData v, NFData k)
                  => Serializers k -> Serializers v
                  -> Tape
                  -> Stream (Of (k, v)) m ()
